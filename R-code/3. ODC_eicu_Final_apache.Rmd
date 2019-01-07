@@ -1,0 +1,946 @@
+---
+title: "Template"
+author: "Anthony O'Brien"
+date: "September 30, 2018"
+output: html_document
+---
+
+#Data import
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+#install.packages("RPostgreSQL")
+#install.packages("Hmisc")
+#install.packages("dplyr")
+#install.packages("caret")
+#install.packages("sjPlot")
+#install.packages("DBI")
+#install.packages("viridis")
+#install.packages("ggpubr")
+library("ggpubr")
+library("viridis")
+library("dplyr")
+library("ggplot2")
+library("bigrquery")
+library("DBI")
+library("RPostgreSQL")
+library("devtools")
+library("MIMICbook")
+```
+
+```{r, include = FALSE}
+if(!("devtools" %in% installed.packages()[,1])) {install.packages("devtools",repos="https://cloud.r-project.org")}
+if(!("MIMICbook" %in% installed.packages()[,1])) {install_github("jraffa/MIMICbook")}
+```
+
+```{r dbconnect, include=FALSE}
+# Load configuration settings
+project_id <- "hst-953-2018"
+options(httr_oauth_cache=TRUE)
+run_query <- function(query)
+    {
+    data <- query_exec(query, project=project_id, max_pages = Inf, use_legacy_sql = FALSE)
+    return(data)
+    }
+```
+
+```{r}
+#sql query for eicu blood gases
+sql_query_eicu <- "with vw0 as (
+  select
+      patientunitstayid
+    , labname
+    , labresultoffset
+    , labresultrevisedoffset
+  from `physionet-data.eicu_crd.lab` AS lab
+  where labname in
+  (
+        'paO2'
+      , 'paCO2'
+      , 'pH'
+      , 'Base Excess'
+      , 'O2 Sat (%)'
+  )
+  group by patientunitstayid, labname, labresultoffset, labresultrevisedoffset
+  having count(distinct labresult)<=1
+), 
+
+
+vw1 as
+(
+  select
+      lab.patientunitstayid
+    , lab.labname
+    , lab.labresultoffset
+    , lab.labresultrevisedoffset
+    , lab.labresult
+    , ROW_NUMBER() OVER(PARTITION BY lab.patientunitstayid, lab.labname, lab.labresultoffset ORDER BY lab.labresultrevisedoffset DESC) as rn
+  from `physionet-data.eicu_crd.lab` AS lab
+  inner join vw0
+    ON  lab.patientunitstayid = vw0.patientunitstayid
+    AND lab.labname = vw0.labname
+    AND lab.labresultoffset = vw0.labresultoffset
+    AND lab.labresultrevisedoffset = vw0.labresultrevisedoffset
+  WHERE
+     (lab.labname = 'paO2' and lab.labresult >= 15 and lab.labresult <= 720)
+  OR (lab.labname = 'paCO2' and lab.labresult >= 5 and lab.labresult <= 250)
+  OR (lab.labname = 'pH' and lab.labresult >= 6.5 and lab.labresult <= 8.5)
+  OR (lab.labname = 'Base Excess' and lab.labresult >= -100 and lab.labresult <= 100)
+  OR (lab.labname = 'O2 Sat (%)' and lab.labresult >= 0 and lab.labresult <=100)
+),
+
+
+ap as 
+  (
+    SELECT
+    patientunitstayid,
+    apachescore
+    FROM `physionet-data.eicu_crd.apachepatientresult` 
+  ),
+
+nc as
+(
+select
+    patientunitstayid
+  , nursingchartoffset
+  , nursingchartentryoffset
+  , case
+      when nursingchartcelltypevallabel = 'Heart Rate'
+       and nursingchartcelltypevalname = 'Heart Rate'
+       and REGEXP_CONTAINS(nursingchartvalue, \"^[-]?[0-9]+[.]?[0-9]*$\")
+       and nursingchartvalue not in ('-','.')
+          then cast(nursingchartvalue as FLOAT64)
+      else null end
+    as heartrate, 
+  case
+      when nursingchartcelltypevallabel = 'Temperature'
+       and nursingchartcelltypevalname = 'Temperature (C)'
+       and REGEXP_CONTAINS(nursingchartvalue, \"^[-]?[0-9]+[.]?[0-9]*$\")
+       and nursingchartvalue not in ('-','.')
+          then cast(nursingchartvalue as FLOAT64)
+      else null end
+    as temperature
+  from `physionet-data.eicu_crd.nursecharting` 
+  -- speed up by only looking at a subset of charted data
+  where nursingchartcelltypecat in
+  (
+    'Vital Signs','Scores','Other Vital Signs and Infusions'
+  )
+)
+
+select
+    vw1.patientunitstayid
+  , vw1.labresultoffset as chartoffset
+  , MAX(case when labname = 'paO2' then labresult else null end) as pao2
+  , MAX(case when labname = 'paCO2' then labresult else null end) as paco2
+  , MAX(case when labname = 'pH' then labresult else null end) as pH
+  , MAX(case when labname = 'Base Excess' then labresult else null end) as baseexcess
+  , MAX(case when labname = 'O2 Sat (%)' then labresult else null end) as spo2
+  , avg(case when v.temperature >= 25 and v.temperature <= 46 then v.temperature else null end) as temperature
+  , avg(ap.apachescore) AS apache 
+from vw1
+INNER JOIN nc
+ON vw1.patientunitstayid = nc.patientunitstayid
+AND vw1.labresultoffset = nc.nursingchartoffset
+INNER JOIN ap
+ON vw1.patientunitstayid= ap.patientunitstayid
+INNER JOIN `physionet-data.eicu_crd_derived.icustay_detail` AS icu
+ON vw1.patientunitstayid = icu.patientunitstayid
+INNER JOIN `physionet-data.eicu_crd_derived.pivoted_vital` AS v
+ON vw1.patientunitstayid = v.patientunitstayid
+AND vw1.labresultoffset = v.chartoffset
+INNER JOIN `physionet-data.eicu_crd.apacheapsvar` AS apa 
+ON vw1.patientunitstayid = apa.patientunitstayid
+
+where rn = 1
+AND SAFE_CAST(icu.age AS FLOAT64) >= 18
+AND icu.unitvisitnumber = 1
+AND v.heartrate > 0
+AND v.heartrate <300
+AND icu.icu_los_hours >= 4
+
+group by patientunitstayid, labresultoffset
+order by patientunitstayid, labresultoffset;"
+```
+
+Please note to optimize speed the above code already applies the exclusion 
+criterias, however if you want to run from the original raw data
+you can remove line 153-158 in the SQL query. This is why we 
+look at the number of users in the dataframe data1 and then eicu_bg. 
+
+```{r}
+#place eicu into a dataframe for blood gases
+data1 <- run_query(sql_query_eicu)
+```
+
+```{r}
+# Write CSV in R from Data
+# write.csv(data1, file = "ODC_eicu_for_apache.csv")
+```
+
+
+```{r}
+#number of unique subjects and their entries
+data1 %>% distinct(patientunitstayid, .keep_all = TRUE) %>% tally()
+```
+
+# Data preparation (cleaning)
+
+```{r}
+#I group the data by hadm_id, then tally/count
+#then this information is stored into a dataframe.
+#to understand the distribution of the users later on.
+n_admissions <- tally(group_by(data1, patientunitstayid)) #idem
+```
+
+```{r}
+#Clean data2
+#In this part I select the rows I want (the inclusion critera), then I drop columns I do not want, then I 
+#add on the tally of the ids, which is useful for counting the number of bloog gas the subject has.
+
+eicu_bg <- data1 %>% left_join(y=n_admissions, by=c("patientunitstayid"))
+df <- eicu_bg #Store eicu into df to run ODC curve equations
+```
+
+```{r}
+#number of unique subjects and their entries
+eicu_bg %>% distinct(patientunitstayid, .keep_all = TRUE) 
+```
+
+```{r}
+#Raw curve using available SO2 and PO2 FROM eicu
+eicu_bg %>% ggplot(aes(pao2,spo2)) + 
+  geom_jitter(alpha=1, color="orange", shape="8") +
+  geom_smooth(color="blue", method=loess)
+``` 
+
+```{r}
+# Oxygen disociation curve standard based off Kellman's equations
+
+po2seq <-0:300
+
+kellman <- function(po2seq)
+  {
+  (
+    100*((-8.532289*10^3*po2seq)+(2.1214010*10^3*po2seq^2)+(-6.7073989*10^1*po2seq^3)+
+     (po2seq^4))/((9.3596087*10^5)+(-3.1346258*10^4*po2seq)+
+                   (2.3961674*10^3*po2seq^2)+(-6.7104406*10^1*po2seq^3)+(po2seq^4)))
+  }
+
+standardso2 <- mapply(kellman, po2seq)
+
+standard_curve <-data.frame(po2seq, standardso2)
+
+```
+
+```{r}
+#ODC standard curve
+standard_curve %>% ggplot(aes(po2seq,standardso2))+
+  geom_line(color="red")+
+  theme_classic() +
+  labs(x="Oxygen partial pressure", 
+       y="Oxygen saturation")
+```
+
+```{r}
+#Rename df columns to fit ODC equations
+df <- df %>% rename(PO2=pao2, TEMP=temperature, PCO2=paco2, BE=baseexcess, PH=pH, SPO2=spo2) %>% filter(!is.na(PO2))
+```
+
+```{r}
+#number of unique subjects and their entries
+df %>% distinct(patientunitstayid, .keep_all = TRUE) 
+```
+
+Filter APACHE Score by 72 or above
+
+```{r}
+df<-df %>% filter(apache >= 72)
+```
+
+Side note
+There were 9,776 unique rows of data for apache scores greater than or equal
+to 72.
+
+
+```{r}
+# RUN ONLY ONE TIME
+# Add Adair's theoretical curve to the data frame
+
+df["theoretical_so2"]<-sapply(df$PO2, kellman)
+```
+
+
+```{r}
+#RUN ONLY ONE TIME
+################################################################################
+################################################################################
+## Kelman's equation (correction for temperature, ph, CO2 using Adair's eq)   ##
+## Reference:                                                                 ##
+## Kelman, G.R., 1966. Digital computer subroutine for the conversion of oxygen#
+## tension into saturation. Journal of Applied Physiology, 21(4), pp.1375-1376.#
+################################################################################
+###############################################################################t
+## Kelman's equation############################################################
+
+#K_PO2v <- x*10^((0.024(37-TEMP))+(0.40*(PH-7.40))+(0.06(log(40)-log(PCO2)))) 
+#K_SO2 <- ((-8.532289*10^3*x)+(2.1214010*10^3*x^2)+(-6.7073989*10^1*x^3)+(x^4))/
+#  ((9.3596087*10^5)+(-3.1346258*10^4*x)+(2.3961674*10^3*x^2)+
+#     (-6.7104406*10^1*x^3)+(x^4))
+
+################################################################################
+################################################################################
+################################################################################
+
+## STEP 1: calculate the virtual PO2
+
+K_PO2V <- function(PO2,TEMP,PH,PCO2)
+  {
+  (PO2*(10^((0.024*(37-TEMP))+(0.40*(PH-7.40))+(0.06*(log(40)-log(PCO2)))))) 
+  }
+
+KPO2V <- mapply(K_PO2V, df$PO2, df$TEMP, df$PH, df$PCO2)
+
+df<-df %>% mutate(KPO2V = KPO2V)
+
+## STEP 2: Use virtual PO2 in Adair's equation to adjust for temp, pH AND PCO2
+
+K_SO2 <- function(KPO2V)
+  {
+  (
+    100*((-8.532289*10^3*KPO2V)+(2.1214010*10^3*KPO2V^2)+(-6.7073989*10^1*KPO2V^3)+
+     (KPO2V^4))/((9.3596087*10^5)+(-3.1346258*10^4*KPO2V)+
+                   (2.3961674*10^3*KPO2V^2)+(-6.7104406*10^1*KPO2V^3)+(KPO2V^4)))
+  }
+
+KSO2 <- mapply(K_SO2, df$KPO2V)
+
+df<- df %>% mutate(KSO2 = KSO2)
+
+```
+
+```{r}
+#RUN ONLY ONE TIME
+################################################################################
+################################################################################
+## Severinghaus' equation                                                     ##
+## Reference:                                                                 ##
+## Severinghaus, J.W., 1979. Simple, accurate equations for human blood O2    ##
+## dissociation computations. Journal of Applied Physiology, 46(3), pp.599-602##
+################################################################################
+###############################################################################o
+## Severinghaus' equation#######################################################
+
+#((((((PO2^3)+(150*PO2))^-1)*23400)+1))^-1)
+
+################################################################################
+################################################################################
+################################################################################
+
+S_S02 <- function(PO2)
+  {
+  (((((((PO2^3)+(150*PO2))^-1)*23400)+1)^-1))
+  }
+
+SSO2 <- mapply(S_S02, df$PO2)
+  
+df<- df %>% mutate(SSO2 = SSO2*100)
+
+```
+
+```{r}
+#RUN ONLY ONE TIME
+################################################################################
+################################################################################
+## Severinghaus' equation (correction for pH)                                 ##
+## Reference:                                                                 ##
+## Severinghaus, J.W., 1979. Simple, accurate equations for human blood O2    ##
+## dissociation computations. Journal of Applied Physiology, 46(3), pp.599-602##  
+################################################################################
+###############################################################################b
+## Severinghaus' equation (correction for pH)################################### 
+#x*((exp(1.1(PH-7.4))))
+#LN_S_PO2V_PH <- ((S_PO2V/26.7)^0.184)+(0.003*BE)-(2.2)
+#S_PO2V_PH <- exp(LN_S_PO2V_PH)
+
+################################################################################
+################################################################################
+################################################################################
+
+## STEP 1: Calculate the virtual PO2 corrected for ph according to Severinghaus
+
+S_PO2V <- function(PO2,PH) 
+  {
+  (PO2*(exp(1.1*(PH-7.4))))
+  }
+
+SPO2V <- mapply(S_PO2V, df$PO2, df$PH)
+
+df <-df %>% mutate(SPO2V = SPO2V)
+
+## STEP 2: Use SPO2V and the following equation to account for Bohr effect
+
+LN_SPO2V_PH <- function(SPO2V, BE) 
+  {
+ ((SPO2V/26.7)^0.184)+(0.003*BE)-(2.2) 
+  }
+
+LNSPO2VPH <- mapply(LN_SPO2V_PH, df$SPO2V, df$BE)
+
+df <-df %>% mutate(LNSPO2VPH = LNSPO2VPH*-100)
+
+# S_PO2V_PH <- function(LNSPO2VPH)
+#   {
+#   exp(LNSPO2VPH)
+#   }
+# 
+# SPO2VPH <- mapply(S_PO2V_PH, df$LNSPO2VPH)
+# 
+# df <-df %>% mutate(SPO2VPH = SPO2VPH)
+
+## STEP 3: Calculate the SO2 using the corrected PO2 for PH according 
+##         to Severinghaus
+
+S_S02_PH <- function(LNSPO2VPH)
+  {
+  ((((((LNSPO2VPH^3)+(150*LNSPO2VPH))^-1)*23400)+1))^-1
+  }
+
+SS02PH <- mapply(S_S02_PH, df$LNSPO2VPH)
+
+df <-df %>% mutate(SS02PH = SS02PH*100)
+
+```
+
+```{r}
+#RUN ONLY ONE TIME
+################################################################################
+################################################################################
+## Severinghaus' equation (correction for T)                                  ##
+## Reference:                                                                 ##
+## Severinghaus, J.W., 1979. Simple, accurate equations for human blood O2    ##
+## dissociation computations. Journal of Applied Physiology, 46(3), pp.599-602## 
+################################################################################
+###############################################################################a
+## Severinghaus' equation (correction for T)####################################
+
+#ln_S_PO2V <- (0.058(((0.243*(x/100))^3.88) + 1)^-1)+0.013
+#S_PO2V_T <- exp(ln_S_PO2V)
+#S_S02_T <- ((((((S_PO2V_T^3)+(150*S_PO2V_T))^-1)*23400)+1))^-1
+
+################################################################################
+################################################################################
+################################################################################
+
+## Step 1: calculate the virtual PO2 corrected for T according to Severinghaus
+
+ln_S_PO2V <- function(PO2)
+  {
+  (0.058*(((0.243*(PO2/100))^3.88) + 1)^-1)+0.013
+  }
+
+lnSPO2V <- mapply(ln_S_PO2V, df$PO2)
+
+df <-df %>% mutate(lnSPO2V = lnSPO2V*1000)
+
+# S_PO2V_T <- function(lnSPO2V)
+#   {
+#   exp(lnSPO2V)
+#   }
+# 
+# SPO2VT <- mapply(S_PO2V_T, df$lnSPO2V)
+
+# df <-df %>% mutate(SPO2VT = SPO2VT)
+
+## Step 2: calculate the SO2 using the virtual PO2 according to Severinghaus
+
+S_SO2_T <- function(lnSPO2V)
+  {
+  ((((((lnSPO2V^3)+(150*lnSPO2V))^-1)*23400)+1))^-1
+  }
+
+SSO2T <- mapply(S_SO2_T, df$lnSPO2V)
+
+df <-df %>% mutate(SSO2T = SSO2T*100)
+```
+
+
+#Putting it all together
+
+```{r}
+
+# ODC curves for each model
+
+p1<-ggplot()+
+  geom_smooth(data=df, aes(PO2,SPO2), color="#0D1687", se=FALSE)+
+  geom_line(data=df, aes(PO2,theoretical_so2), color="#FF332F")+
+  labs(x="", 
+       y="Oxygen saturation (%)",
+       title="", 
+       subtitle="")+
+  theme_classic()+
+  theme(legend.position="none")+
+  coord_cartesian(xlim=(c(0,300)))
+
+p2<-ggplot()+
+  geom_smooth(data=df, aes(PO2,SPO2), color="#0D1687", se=FALSE, span=0.3)+
+  geom_line(data=df, aes(KPO2V,KSO2, color="#FF332F"))+
+  labs(x="", 
+       y="Oxygen saturation (%)",
+       title="", 
+       subtitle="")+
+  theme_classic()+
+  theme(legend.position="none")+
+  coord_cartesian(xlim=(c(0,300)))
+
+p3<-ggplot()+
+  geom_smooth(data=df, aes(PO2,SPO2), color="#0D1687", se=FALSE, span=0.3)+
+  geom_line(data=df, aes(PO2, SSO2, color="#FF332F"))+
+  labs(x="", 
+       y="O2 Sat (%)",
+       title="", 
+       subtitle="")+
+  theme_classic()+
+  theme(legend.position="none")+
+  coord_cartesian(xlim=(c(0,300)))
+
+p4<-ggplot()+
+  geom_smooth(data=df, aes(PO2,SPO2), color="#0D1687", se=FALSE, span=1)+
+  geom_line(data=df, aes(LNSPO2VPH, SS02PH, color="#FF332F"))+
+  labs(x="", 
+       y="O2 Sat (%)",
+       title="", 
+       subtitle="")+
+  theme_classic()+
+  theme(legend.position="none")+
+  coord_cartesian(xlim=(c(0,300)))
+
+p5<-ggplot()+
+  geom_smooth(data=df, aes(PO2,SPO2), color="#0D1687", se=FALSE, span=1)+
+  geom_line(data=df, aes(lnSPO2V, SSO2T, color="#FF332F"))+
+  labs(x="Oxygen partial pressure (mmHg)", 
+       y="O2 Sat (%)",
+       title="", 
+       subtitle="")+
+  theme_classic()+
+  theme(legend.position="none")+
+  coord_cartesian(xlim=(c(0,300)))
+
+# Extrapolate the smooth data for patient data, this is bases for comparison of patient data
+
+p<-qplot(df$PO2,df$SPO2) + stat_smooth()
+linear_1<-ggplot_build(p)$data[[2]]
+linear_1["theoretical_so2"]<-sapply(linear_1$x, kellman)
+linear_1["theoretical_so2_x"]<-linear_1$theoretical_so2
+
+# Cumulative distribtion curve
+
+pcd1<-ggplot() + 
+  stat_ecdf(data=linear_1, aes(theoretical_so2), geom = "step", color="#FF332F") +  
+  stat_ecdf(data=linear_1, aes(y), geom = "step", color="#0D1687") + 
+  labs(x="", 
+       y="Cumulative density",
+       title="")+ 
+  theme_classic()
+
+pcd2<-ggplot() + 
+  stat_ecdf(data=df, aes(KSO2), geom = "step", color="#FF332F") +
+  stat_ecdf(data=linear_1, aes(y), geom = "step", color="#0D1687")  +
+  labs(x="", 
+       y="Cumulative density",
+       title="")+ 
+  theme_classic()
+
+pcd3<-ggplot() + 
+  stat_ecdf(data=df, aes(SSO2), geom = "step", color="#FF332F") +
+  stat_ecdf(data=linear_1, aes(y), geom = "step", color="#0D1687") +
+  labs(x="", 
+       y="CD",
+       title="")+ 
+  theme_classic()
+
+pcd4<-ggplot() + 
+  stat_ecdf(data=df, aes(SS02PH), geom = "step", color="#FF332F") +
+  stat_ecdf(data=linear_1, aes(y), geom = "step", color="#0D1687") +
+  labs(x="", 
+       y="CD",
+       title="")+ 
+  theme_classic() 
+
+pcd5<-ggplot() + 
+  stat_ecdf(data=df, aes(SSO2T), geom = "step", color="#FF332F") +
+  stat_ecdf(data=linear_1, aes(y), geom = "step", color="#0D1687") +
+  labs(x="Oxygen saturation (%)", 
+       y="CD",
+       title="")+ 
+  theme_classic()  
+
+
+# Kolmogorov Smirnov test
+
+ks.test(linear_1$y, df$theoretical_so2)
+ks.test(linear_1$y,df$KSO2)
+ks.test(linear_1$y,df$SSO2)
+ks.test(linear_1$y,df$SS02PH)
+ks.test(linear_1$y,df$SSO2T)
+
+# Define number of samples and permutations
+
+N<-10000
+B <- 10000
+
+# Define sampling function for each variable
+
+f1 <- function(y){
+  X <- sample(df$theoretical_so2, N, replace = TRUE)
+  mean(X)
+}
+
+f1b<-function(y){
+  X <- sample(linear_1$theoretical_so2, N, replace = TRUE)
+  mean(X)
+}
+
+f2 <- function(y){
+  X <- sample(linear_1$y, N, replace = TRUE)
+  mean(X)
+}
+
+df3<- df %>% filter(!is.na(KSO2)) %>% select(KSO2)
+f3 <- function(y){
+  X <- sample(df3$KSO2, N, replace = TRUE)
+  mean(X)
+}
+
+df4<- df %>% filter(!is.na(SSO2)) %>% select(SSO2)
+f4 <- function(y){
+  X <- sample(df4$SSO2, N, replace = TRUE)
+  mean(X)
+}
+
+df5<- df %>% filter(!is.na(SS02PH)) %>% select(SS02PH)
+f5 <- function(y){
+  X <- sample(df5$SS02PH, N, replace = TRUE)
+  mean(X)
+}
+
+df6<-df %>% filter(!is.na(SSO2T)) %>% select(SSO2T)
+f6 <- function(y){
+  X <- sample(df6$SSO2T, N, replace = TRUE)
+  mean(X)
+}
+
+# Monte Carlo permutation for modeled data and theoeretical data 
+
+R1 <- as.data.frame(replicate(B, f1(x)))
+R1b <- as.data.frame(replicate(B, f1b(x)))
+R2 <- as.data.frame(replicate(B, f2(x)))
+R3 <- as.data.frame(replicate(B, f3(x)))
+R4 <- as.data.frame(replicate(B, f4(x)))
+R5 <- as.data.frame(replicate(B, f5(x)))
+R6 <- as.data.frame(replicate(B, f5(x)))
+
+# Rename columns 
+names(R1)[1]<-"theoretical"
+names(R1b)[1]<-"theoretical_for_patient"
+names(R2)[1]<-"patient"
+names(R3)[1]<-"kellman"
+names(R4)[1]<-"severinghaus_unadjusted"
+names(R5)[1]<-"severinghaus_ph"
+names(R6)[1]<-"severinghaus_temp"
+
+
+# Histograms 
+# note the histograms need to be adjusted for comparing patient data 
+# to models. At present the individual plots are looking at the models 
+# comparing each other while the final one compares to patients.
+
+ph1<-ggplot()+
+  geom_histogram(aes(R1b$theoretical_for_patient), fill="#FF332F", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R2$patient), fill="#0D1687", color="grey10", alpha=1/10, bins = 200)+
+  labs(x="Oxygen saturation (%)", 
+       y="Count",
+       title="")+ 
+  theme_classic()
+
+ph2<-ggplot()+
+  geom_histogram(aes(R1$theoretical), fill="#FF332F", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R3$kellman), fill="#0D1687", color="grey10", alpha=1/10, bins = 200)+
+  labs(x="Oxygen saturation (%)", 
+       y="Count",
+       title="")+ 
+  theme_classic()
+
+ph3<-ggplot()+
+  geom_histogram(aes(R1$theoretical), fill="#FF332F", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R4$severinghaus_unadjusted), fill="#0D1687", color="grey10", alpha=1/10, bins = 200)+
+  labs(x="Oxygen saturation (%)", 
+       y="Count",
+       title="")+ 
+  theme_classic()
+
+ph4<-ggplot()+
+  geom_histogram(aes(R1$theoretical), fill="#FF332F", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R5$severinghaus_ph), fill="#0D1687", color="grey10", alpha=1/10, bins = 200)+
+  labs(x="Oxygen saturation (%)", 
+       y="Count",
+       title="")+ 
+  theme_classic()
+
+ph5<-ggplot()+
+  geom_histogram(aes(R1$theoretical), fill="#FF332F", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R6$severinghaus_temp), fill="#0D1687", color="grey10", alpha=1/10, bins = 200)+
+  labs(x="Oxygen saturation (%)", 
+       y="Count",
+       title="")+ 
+  theme_classic()
+
+ph6<-ggplot()+
+  geom_histogram(aes(R1$theoretical), fill="#FF332F", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R2$patient), fill="#0D1687", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R3$kellman), fill="#0D1687", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R4$severinghaus_unadjusted), fill="#0D1687", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R5$severinghaus_ph), fill="#0D1687", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R6$severinghaus_temp), fill="#0D1687", color="grey10", alpha=1/10, bins = 200)+
+  labs(x="Oxygen saturation (%)", 
+       y="Count",
+       title="")+ 
+  theme_classic()
+
+# ttest
+t.test(R2$patient, R1b$theoretical_for_patient)
+t.test(R2$patient, R3$kellman)
+t.test(R2$patient, R4$severinghaus_unadjusted)
+t.test(R2$patient, R5$severinghaus_ph)
+t.test(R2$patient, R6$severinghaus_temp)
+
+#95%CI
+t.test(R1$theoretical, conf.level = 0.95)
+t.test(R2$patient, conf.level = 0.95)
+t.test(R3$kellman, conf.level = 0.95)
+t.test(R4$severinghaus_unadjusted, conf.level = 0.95)
+t.test(R5$severinghaus_ph, conf.level = 0.95)
+t.test(R6$severinghaus_temp, conf.level = 0.95)
+
+#Median
+median(R1$theoretical)
+median(R2$patient)
+median(R3$kellman)
+median(R4$severinghaus_unadjusted)
+median(R5$severinghaus_ph)
+median(R6$severinghaus_temp)
+
+#IQR
+IQR(R1$theoretical)
+IQR(R2$patient)
+IQR(R3$kellman)
+IQR(R4$severinghaus_unadjusted)
+IQR(R5$severinghaus_ph)
+IQR(R6$severinghaus_temp)
+
+
+
+#this extracts the smoothed saturation results for kellman adjusted data and adds the theortical saturation values
+r<-qplot(df$KPO2V,df$KSO2) + stat_smooth()
+linear_2<-ggplot_build(r)$data[[2]]
+linear_2["theoretical_so2"]<-sapply(linear_2$x, kellman)
+linear_2["theoretical_so2_x"]<-linear_2$theoretical_so2
+
+#this extracts the smoothed saturation results for severinghaus uadjusted data and adds the theortical saturation values
+a<-qplot(df$PO2,df$SSO2) + stat_smooth()
+linear_3<-ggplot_build(a)$data[[2]]
+linear_3["theoretical_so2"]<-sapply(linear_3$x, kellman)
+linear_3["theoretical_so2_x"]<-linear_3$theoretical_so2
+
+#this extracts the smoothed saturation results for severinghaus adjusted ph data and adds the theortical saturation values
+o<-qplot(df$LNSPO2VPH,df$SS02PH) + stat_smooth()
+linear_4<-ggplot_build(o)$data[[2]]
+linear_4["theoretical_so2"]<-sapply(linear_4$x, kellman)
+linear_4["theoretical_so2_x"]<-linear_4$theoretical_so2
+
+#this extracts the smoothed saturation results for severinghaus adjusted t data and adds the theortical saturation values
+b<-qplot(df$lnSPO2V,df$SSO2T) + stat_smooth()
+linear_5<-ggplot_build(p)$data[[2]]
+linear_5["theoretical_so2"]<-sapply(linear_5$x, kellman)
+linear_5["theoretical_so2_x"]<-linear_5$theoretical_so2
+
+#Linear equations for modeled data
+l1<-summary(lm(linear_1$theoretical_so2~linear_1$y))
+l2<-summary(lm(linear_2$y~linear_1$y))
+l3<-summary(lm(linear_3$y~linear_1$y))
+l4<-summary(lm(linear_4$y~linear_1$y))
+l5<-summary(lm(linear_5$y~linear_1$y))
+
+
+#Linear model graph 
+pl1<-ggplot() +
+  geom_line(aes(standard_curve$standardso2, standard_curve$standardso2, color = "Theoretical saturation"))+
+  geom_abline(aes(intercept = coef(l1)[1], slope = coef(l1)[2], color= "Patient modeled saturation"), show.legend =TRUE)+
+  geom_abline(aes(intercept = coef(l2)[1], slope = coef(l2)[2], color= "Kellman modeled saturation"), show.legend =TRUE)+
+  geom_abline(aes(intercept = coef(l3)[1], slope = coef(l3)[2], color= "Severinghaus modeled saturation"), show.legend =TRUE)+
+  geom_abline(aes(intercept = coef(l4)[1], slope = coef(l4)[2], color= "Severinghaus (pH adjusted) modeled saturation"), show.legend =TRUE)+
+  geom_abline(aes(intercept = coef(l5)[1], slope = coef(l5)[2], color= "Severinghaus (Temp adjusted) modeled saturation"), show.legend =TRUE)+
+  labs(x="Oxygen saturation (%)", 
+       y="Theoretical saturation (%)",
+       title="") +
+  scale_color_viridis(name="", discrete=TRUE, option="viridis")+
+  theme_bw()
+
+#Linear model graph with all intercepts at 0
+pl2<-ggplot() +
+  geom_line(aes(standard_curve$standardso2, standard_curve$standardso2, color = "Theoretical saturation"))+
+  geom_abline(aes(intercept = 0, slope = coef(l1)[2], color= "Patient modeled saturation"), show.legend =TRUE)+
+  geom_abline(aes(intercept = 0, slope = coef(l2)[2], color= "Kellman modeled saturation"), show.legend =TRUE)+
+  geom_abline(aes(intercept = 0, slope = coef(l3)[2], color= "Severinghaus modeled saturation"), show.legend =TRUE)+
+  geom_abline(aes(intercept = 0, slope = coef(l4)[2], color= "Severinghaus (pH adjusted) modeled saturation"), show.legend =TRUE)+
+  geom_abline(aes(intercept = 0, slope = coef(l5)[2], color= "Severinghaus (Temp adjusted) modeled saturation"), show.legend =TRUE)+
+  labs(x="Oxygen saturation (%)", 
+       y="Theoretical sturation (%)",
+       title="") +
+  labs(x="Oxygen saturation (%)", 
+       y="Theoretical saturation (%)",
+       title="") +
+  scale_color_viridis(name="", discrete=TRUE, option="viridis")+
+  theme_bw()
+
+
+
+```
+
+
+
+```{r}
+labels <- data.frame(x = c(1984, 1942), y = c(150, 150))
+
+ph7<-ggplot()+
+  geom_histogram(aes(R1$theoretical), fill="#d7191c", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R2$patient), fill="#fdae61", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R3$kellman), fill="#ffffbf", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R4$severinghaus_unadjusted), fill="#482677", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R5$severinghaus_ph), fill="#abd9e9", color="grey10", alpha=1/10, bins = 200)+
+  geom_histogram(aes(R6$severinghaus_temp), fill="black", color="grey10", alpha=1/10, bins = 200)+
+  geom_text(data = labels, aes(96.25, 200, label = "Patient", angle = 45), size = 3.5, alpha=5/10)+
+  geom_text(data = labels, aes(95.9, 850, label = "Adairs", angle = 45), size = 3.5, alpha=5/10)+
+  geom_text(data = labels, aes(95.7, 800, label = "Kellman ", angle = 45), size = 3.5, alpha=5/10)+
+  geom_text(data = labels, aes(96.65, 1000, label = "Severinghaus", angle = 45), size = 3.5, alpha=5/10)+
+  geom_text(data = labels, aes(96.15, 850, label = "Severinghaus Temp and pH", angle = 45), size = 3.5, alpha=5/10)+
+  labs(x="Oxygen saturation (%)", 
+       y="Count",
+       title="")+ 
+  theme_classic()
+
+ph7
+```
+
+
+#Format graphs
+
+```{r}
+
+gar1<-ggarrange(p1, pcd1,
+          p2, pcd2, 
+          labels = c("A", "", "B"),
+          ncol = 2, nrow = 2)
+
+gar2<-ggarrange(p3, pcd3,
+          p4, pcd4,
+          p5, pcd5,
+          labels = c("C", "", "D", "", "E"),
+          ncol = 2, nrow = 3)
+
+```
+
+#Save plots into a high res tiff
+
+```{r}
+#save graphs
+tiff("eicu_1.tiff", units="in", width=7.5, height=5.75, res=600)
+gar1
+dev.off()
+
+tiff("eicu_2.tiff", units="in", width=7.5, height=5.75, res=600)
+gar2
+dev.off()
+
+tiff("eicu_3.tiff", units="in", width=7.5, height=5.75, res=600)
+ph7
+dev.off()
+```
+
+
+#p50 , po2, spo2 and severity score 
+
+```{r}
+#for standard curve
+standard_curve %>% select(po2seq, standardso2) %>% summary()
+standard_curve %>% select(po2seq, standardso2) %>% filter(standardso2>=50 & standardso2<51) %>% summary()
+theoryp50<-df %>% select(PO2, theoretical_so2) %>% filter(theoretical_so2>=50 & theoretical_so2<51)
+#for raw data
+df %>% select(PO2, SPO2, apache) %>% summary()
+df %>% select(PO2, SPO2) %>% filter(SPO2>=50 & SPO2<51) %>% summary(ttest=t.test())
+rawp50<-df %>% select(PO2, SPO2) %>% filter(SPO2>=50 & SPO2<51)
+#statistical test
+rawp50<-df %>% select(PO2, SPO2) %>% filter(SPO2>=50 & SPO2<51)
+wilcox.test(theoryp50$PO2, rawp50$PO2, alternative = "two.sided")
+# SEVERINGHAUS RAW data
+df %>% select(PO2, SSO2, apache) %>% summary()
+df %>% select(PO2, SSO2, apache) %>% filter(SSO2>=50 & SSO2<51) %>% summary()
+sevp50<-df %>% select(PO2, SSO2) %>% filter(SSO2>=50 & SSO2<51)
+wilcox.test(theoryp50$PO2, sevp50$PO2, alternative = "two.sided")
+# SEVERINGHAUS ph corrected data
+df %>% select(LNSPO2VPH,SS02PH, apache) %>% summary()
+df %>% select(LNSPO2VPH,SS02PH, apache) %>% filter(SS02PH>=50 & SS02PH<51) %>% summary()
+php50<-df %>% select(LNSPO2VPH, SS02PH) %>% filter(SS02PH>=50 & SS02PH<51)
+#wilcox.test(theoryp50$PO2, php50$LNSPO2VPH, alternative = "two.sided") not enough observations
+# SEVERINGHAUS temperature corrected data
+df %>% select(lnSPO2V,SSO2T, apache) %>% summary()
+df %>% select(lnSPO2V,SSO2T, apache) %>% filter(SSO2T>=50 & SSO2T<51) %>% summary()
+tp50<-df %>% select(lnSPO2V, SSO2T) %>% filter(SSO2T>=50 & SSO2T<51)
+wilcox.test(theoryp50$PO2, tp50$SSO2T, alternative = "two.sided")
+# kellman
+df %>% select(KPO2V, KSO2, apache) %>% summary()
+df %>% select(KPO2V, KSO2, apache) %>% filter(KSO2>=50 & KSO2<51) %>% summary()
+kp50<-df %>% select(KPO2V, KSO2) %>% filter(KSO2>=50 & KSO2<51)
+wilcox.test(theoryp50$PO2, kp50$KSO2, alternative = "two.sided")
+
+
+```
+
+#p90
+
+```{r}
+#for standard curve
+standard_curve %>% select(po2seq, standardso2) %>% summary()
+standard_curve %>% select(po2seq, standardso2) %>% filter(standardso2>=90 & standardso2<91) %>% summary()
+theoryp90<-df %>% select(PO2, theoretical_so2) %>% filter(theoretical_so2>=90 & theoretical_so2<91)
+#for raw data
+df %>% select(PO2, SPO2, apache) %>% summary()
+df %>% select(PO2, SPO2) %>% filter(SPO2>=90 & SPO2<91) %>% summary(ttest=t.test())
+rawp90<-df %>% select(PO2, SPO2) %>% filter(SPO2>=90 & SPO2<91)
+#statistical test
+rawp90<-df %>% select(PO2, SPO2) %>% filter(SPO2>=90 & SPO2<91)
+wilcox.test(theoryp90$PO2, rawp90$PO2, alternative = "two.sided")
+# SEVERINGHAUS RAW data
+df %>% select(PO2, SSO2, apache) %>% summary()
+df %>% select(PO2, SSO2, apache) %>% filter(SSO2>=90 & SSO2<91) %>% summary()
+sevp90<-df %>% select(PO2, SSO2) %>% filter(SSO2>=90 & SSO2<91)
+wilcox.test(theoryp90$PO2, sevp90$PO2, alternative = "two.sided")
+# SEVERINGHAUS ph corrected data
+df %>% select(LNSPO2VPH,SS02PH, apache) %>% summary()
+df %>% select(LNSPO2VPH,SS02PH, apache) %>% filter(SS02PH>=90 & SS02PH<91) %>% summary()
+php90<-df %>% select(LNSPO2VPH, SS02PH) %>% filter(SS02PH>=90 & SS02PH<91)
+wilcox.test(theoryp90$PO2, php90$LNSPO2VPH, alternative = "two.sided") 
+# SEVERINGHAUS temperature corrected data
+df %>% select(lnSPO2V,SSO2T, apache) %>% summary()
+df %>% select(lnSPO2V,SSO2T, apache) %>% filter(SSO2T>=90 & SSO2T<91) %>% summary()
+tp90<-df %>% select(lnSPO2V, SSO2T) %>% filter(SSO2T>=90 & SSO2T<91)
+wilcox.test(theoryp90$PO2, tp90$SSO2T, alternative = "two.sided")
+# kellman
+df %>% select(KPO2V, KSO2, apache) %>% summary()
+df %>% select(KPO2V, KSO2, apache) %>% filter(KSO2>=90 & KSO2<91) %>% summary()
+kp90<-df %>% select(KPO2V, KSO2) %>% filter(KSO2>=90 & KSO2<91)
+wilcox.test(theoryp90$PO2, kp90$KSO2, alternative = "two.sided")
+```
+
+
+
