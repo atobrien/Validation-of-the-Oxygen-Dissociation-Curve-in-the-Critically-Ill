@@ -20,6 +20,6 @@ Our study validates that on average the shape of the ODC in the critically ill i
 ## Key Words: 
 Oxygen dissociation curve, critically ill, Intensive care unit
 
-# Authors: 
+# Authors
 Harvard-MIT Health, Sciences and Technology 953: Collaborative Data Science in Medicine Group
 (names and affiliations will be added a posteriori)
